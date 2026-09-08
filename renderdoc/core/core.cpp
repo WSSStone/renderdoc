@@ -2505,14 +2505,23 @@ void RenderDoc::AddFrameCapturer(DeviceOwnedWindow devWnd, IFrameCapturer *cap)
 void RenderDoc::RemoveFrameCapturer(DeviceOwnedWindow devWnd)
 {
   SCOPED_LOCK(m_CaptureOperationLock);
-  IFrameCapturer *removed = MatchFrameCapturer(devWnd);
-  if(removed && m_BridgeCapture.Contains(removed))
+  if(IsReplayApp())
+    return;
+
+  bool removesCaptureWindow = false;
+  {
+    SCOPED_LOCK(m_CapturerListLock);
+    auto entry = m_WindowFrameCapturers.find(devWnd);
+    removesCaptureWindow = entry != m_WindowFrameCapturers.end() && entry->second.RefCount == 1 &&
+                           m_BridgeCapture.owner == entry->second.FrameCapturer &&
+                           !m_BridgeCapture.members.empty() &&
+                           m_BridgeCapture.members[0].window == devWnd;
+  }
+  if(removesCaptureWindow)
   {
     m_BridgeCapture.Finish(m_BridgeCapture.owner, true);
     m_CapturesActive--;
   }
-  if(IsReplayApp())
-    return;
 
   RDCLOG("Removing frame capturer for %#p / %#p", devWnd.device, devWnd.windowHandle);
 
@@ -3031,6 +3040,17 @@ TEST_CASE("Core bridge switch, readiness and teardown integration", "[core][brid
   core.StartFrameCapture(window);
   CHECK(peer.starts == 2);
   REQUIRE(core.DiscardFrameCapture(window));
+  CHECK_FALSE(core.IsFrameCapturing());
+
+  DeviceOwnedWindow captureWindow(&owner, &peer);
+  core.AddFrameCapturer(captureWindow, &owner);
+  core.AddFrameCapturer(captureWindow, &owner);
+  core.StartFrameCapture(captureWindow);
+  core.RemoveFrameCapturer(DeviceOwnedWindow(&owner, &unready));
+  CHECK(core.IsFrameCapturing());
+  core.RemoveFrameCapturer(captureWindow);
+  CHECK(core.IsFrameCapturing());
+  core.RemoveFrameCapturer(captureWindow);
   CHECK_FALSE(core.IsFrameCapturing());
 }
 
