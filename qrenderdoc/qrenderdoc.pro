@@ -166,7 +166,8 @@ win32 {
 
 # Add our sources first so Qt Creator adds new files here
 
-SOURCES += Code/qrenderdoc.cpp \
+SOURCES += Code/FBXExporter.cpp \
+    Code/qrenderdoc.cpp \
     Code/qprocessinfo.cpp \
     Code/ReplayManager.cpp \
     Code/CaptureContext.cpp \
@@ -258,7 +259,8 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/Dialogs/AxisMappingDialog.cpp \
     Windows/Dialogs/CameraControlsDialog.cpp \
     Windows/Dialogs/ProjectionGuessDialog.cpp
-HEADERS += Code/CaptureContext.h \
+HEADERS += Code/FBXExporter.h \
+    Code/CaptureContext.h \
     Code/qprocessinfo.h \
     Code/ReplayManager.h \
     Code/ScintillaSyntax.h \

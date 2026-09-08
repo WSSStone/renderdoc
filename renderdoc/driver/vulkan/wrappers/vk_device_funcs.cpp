@@ -5437,6 +5437,9 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     m_DebugManager = new VulkanDebugManager(this);
   }
 
+  if(ret == VK_SUCCESS && !IsReplayMode(m_State))
+    RenderDoc::Inst().SetVulkanBridgeReady(this, true);
+
   FirstFrame();
 
   return ret;
@@ -5446,6 +5449,8 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 {
   if(device == VK_NULL_HANDLE)
     return;
+
+  RenderDoc::Inst().SetVulkanBridgeReady(this, false);
 
   if(m_MemoryFreeThread)
   {

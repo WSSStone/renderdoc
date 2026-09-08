@@ -1,0 +1,99 @@
+name: Windows bridge and FBX
+
+on:
+  push:
+    branches: [codex/vulkan-bridge-fbx-export]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-bridge-fbx-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Development, Release]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download Qt and Python dependencies
+        shell: pwsh
+        run: |
+          curl.exe --fail --location --retry 3 https://renderdoc.org/qrenderdoc_3rdparty.zip -o qrenderdoc_3rdparty.zip
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          7z x qrenderdoc_3rdparty.zip -y
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: microsoft/setup-msbuild@v3
+      - name: Check source formatting
+        if: matrix.configuration == 'Development'
+        shell: bash
+        run: |
+          util/clangformat/clang-format-15.0.exe --dry-run --Werror renderdoc/core/core.{h,cpp} renderdoc/driver/vulkan/vk_core.h renderdoc/driver/vulkan/wrappers/vk_device_funcs.cpp qrenderdoc/Code/FBXExporter.{h,cpp} qrenderdoc/Windows/BufferViewer.{h,cpp}
+      - name: Build complete solution
+        shell: pwsh
+        run: |
+          msbuild.exe renderdoc.sln /m /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143 /bl:build.binlog /fl '/flp:logfile=build.log;verbosity=normal'
+          exit $LASTEXITCODE
+      - name: Core unit tests
+        if: matrix.configuration == 'Development'
+        shell: pwsh
+        run: |
+          & ./x64/Development/renderdoccmd.exe test unit -o core-tests.log
+          exit $LASTEXITCODE
+      - name: UI unit tests and FBX fixture
+        if: matrix.configuration == 'Development'
+        shell: pwsh
+        env:
+          RENDERDOC_FBX_TEST_OUTPUT: ${{ github.workspace }}/fbx-fixture.fbx
+        run: |
+          $process = Start-Process -FilePath ./x64/Development/qrenderdoc.exe -ArgumentList '--unittest', 'log=ui-tests.log' -Wait -PassThru
+          if ($process.ExitCode) { exit $process.ExitCode }
+          if (!(Test-Path fbx-fixture.fbx)) { throw 'FBX fixture test did not run' }
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.configuration }}-logs
+          path: |
+            build.log
+            build.binlog
+            *tests.log
+          if-no-files-found: warn
+      - name: Upload reader fixture
+        if: matrix.configuration == 'Development'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbx-fixture
+          path: fbx-fixture.fbx
+          if-no-files-found: error
+      - name: Upload Release runtime
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RenderDoc-Windows-x64-${{ github.sha }}
+          path: x64/Release/
+          if-no-files-found: error
+
+  fbx-reader:
+    needs: windows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: fbx-fixture
+      - name: Build pinned independent FBX reader
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ufbx"
+          for file in ufbx.c ufbx.h; do
+            curl --fail --location --retry 3 "https://raw.githubusercontent.com/ufbx/ufbx/fcc5d6ba444cfd3eb80677dba5e37e493941abe5/$file" -o "$RUNNER_TEMP/ufbx/$file"
+          done
+          cc -std=c99 -O2 -I"$RUNNER_TEMP/ufbx" util/test/validate_fbx.c "$RUNNER_TEMP/ufbx/ufbx.c" -lm -o "$RUNNER_TEMP/validate-fbx"
+          "$RUNNER_TEMP/validate-fbx" fbx-fixture.fbx

@@ -159,6 +159,12 @@
     <ClCompile Include="Code\QRDUtils.cpp">
       <Filter>Code</Filter>
     </ClCompile>
+    <ClInclude Include="Code\FBXExporter.h">
+      <Filter>Code</Filter>
+    </ClInclude>
+    <ClCompile Include="Code\FBXExporter.cpp">
+      <Filter>Code</Filter>
+    </ClCompile>
     <ClCompile Include="Code\qprocessinfo.cpp">
       <Filter>Code</Filter>
     </ClCompile>

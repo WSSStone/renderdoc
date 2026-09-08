@@ -1159,6 +1159,10 @@ private:
   void ApplyRPLoadDiscards(VkCommandBuffer commandBuffer, VkRect2D renderArea);
 
   RDCDriver GetFrameCaptureDriver() { return RDCDriver::Vulkan; }
+  bool CanBridgeCapture() override
+  {
+    return m_Device != VK_NULL_HANDLE && m_QueueFamilyIdx != ~0U && IsBackgroundCapturing(m_State);
+  }
   void StartFrameCapture(DeviceOwnedWindow devWnd);
   bool EndFrameCapture(DeviceOwnedWindow devWnd);
   bool DiscardFrameCapture(DeviceOwnedWindow devWnd);

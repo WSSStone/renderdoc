@@ -24,18 +24,24 @@
 
 #include "BufferViewer.h"
 #include <float.h>
+#include <QComboBox>
+#include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFontDatabase>
+#include <QFormLayout>
 #include <QItemSelection>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QMutexLocker>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QScrollBar>
 #include <QSplitter>
 #include <QTimer>
 #include <QToolTip>
 #include <QtMath>
+#include <cmath>
+#include "Code/FBXExporter.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/CollapseGroupBox.h"
@@ -2498,6 +2504,9 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
 
   m_ExportMenu->addAction(m_ExportCSV);
   m_ExportMenu->addAction(m_ExportBytes);
+  m_ExportFBX = m_ExportMenu->addAction(tr("Export FBX and textures..."));
+  m_ExportFBX->setVisible(m_MeshView);
+  QObject::connect(m_ExportFBX, &QAction::triggered, this, &BufferViewer::exportFBX);
 
   m_DebugVert = new QAction(tr("&Debug this Vertex"), this);
   m_DebugVert->setIcon(Icons::wrench());
@@ -6359,6 +6368,7 @@ void BufferViewer::on_byteRangeLength_valueChanged(double value)
 
 void BufferViewer::updateExportActionNames()
 {
+  m_ExportFBX->setEnabled(m_MeshView && m_CurView && m_Ctx.IsCaptureLoaded() && m_Ctx.CurAction());
   QString csv = tr("Export%1 to &CSV");
   QString bytes = tr("Export%1 to &Bytes");
 
@@ -6411,6 +6421,303 @@ void BufferViewer::updateExportActionNames()
       m_ExportBytes->setText(bytes.arg(lit(" ") + m_RepeatedGroup->title()));
     }
   }
+}
+
+// Decode attributes using the same format interpreter as the mesh table, but never its text.
+// Validate integer offsets before constructing pointers (including instance-rate offsets).
+static bool ReadFBXAttribute(const BufferConfiguration &config, int column, uint32_t vertex,
+                             int components, QVector<double> &values, QString &error)
+{
+  if(column < 0 || column >= config.columns.count() || column >= config.props.count())
+  {
+    error = QObject::tr("Missing vertex attribute.");
+    return false;
+  }
+  const ShaderConstant &el = config.columns[column];
+  const BufferElementProperties &prop = config.props[column];
+  QVariantList decoded;
+  if(column < config.genericsEnabled.size() && config.genericsEnabled[column])
+  {
+    if(column >= config.generics.size())
+      return false;
+    for(int c = 0; c < qMin(4, int(el.type.columns)); c++)
+    {
+      if(prop.format.compType == CompType::UInt)
+        decoded << config.generics[column].uintValue[c];
+      else if(prop.format.compType == CompType::SInt)
+        decoded << config.generics[column].intValue[c];
+      else
+        decoded << config.generics[column].floatValue[c];
+    }
+  }
+  else
+  {
+    if(prop.perprimitive || prop.buffer < 0 || prop.buffer >= config.buffers.size() ||
+       !config.buffers[prop.buffer])
+    {
+      error = QObject::tr("Attribute '%1' has no per-vertex data.").arg(QString(el.name));
+      return false;
+    }
+    BufferData *buffer = config.buffers[prop.buffer];
+    uint64_t element = vertex;
+    if(prop.perinstance)
+      element = prop.instancerate > 0 ? config.curInstance / prop.instancerate : 0;
+    uint64_t offset = uint64_t(el.byteOffset) + uint64_t(buffer->stride) * element;
+    uint64_t byteSize = el.type.arrayByteStride;
+    if(!byteSize)
+      byteSize = prop.format.ElementSize();
+    if(offset > buffer->size() || byteSize > buffer->size() - offset)
+    {
+      error = QObject::tr("Attribute '%1' reads past the vertex buffer.").arg(QString(el.name));
+      return false;
+    }
+    const byte *data = buffer->data() + offset;
+    decoded = GetVariants(prop.format, el, data, buffer->end());
+  }
+  // RGB colors get an opaque alpha. Other missing components are errors.
+  if(components == 4 && decoded.size() == 3)
+    decoded << 1.0;
+  if(decoded.size() < components)
+  {
+    error = QObject::tr("Attribute '%1' has too few components.").arg(QString(el.name));
+    return false;
+  }
+  for(int c = 0; c < components; c++)
+  {
+    bool ok = false;
+    double value = decoded[c].toDouble(&ok);
+    if(!ok || !std::isfinite(value))
+    {
+      error = QObject::tr("Attribute '%1' contains an invalid number.").arg(QString(el.name));
+      return false;
+    }
+    values.push_back(value);
+  }
+  return true;
+}
+
+static bool MakeFBXMesh(const BufferConfiguration &config, const QVector<int> &mapping,
+                        FBXExporter::Mesh &mesh, QString &error)
+{
+  if(config.noVertices || config.noInstances || config.numRows == 0 ||
+     config.numRows > uint32_t(INT_MAX / 4))
+  {
+    error = QObject::tr("No exportable mesh, or mesh exceeds the exporter size limit.");
+    return false;
+  }
+  FBXExporter::Attribute *attributes[] = {&mesh.normal, &mesh.tangent, &mesh.uv[0],
+                                          &mesh.uv[1],  &mesh.uv[2],   &mesh.color};
+  const int components[] = {3, 3, 2, 2, 2, 4};
+  for(int a = 0; a < 6; a++)
+  {
+    attributes[a]->components = components[a];
+    if(mapping[a + 1] >= 0)
+      attributes[a]->name = config.columnName(mapping[a + 1]);
+  }
+  QVector<uint32_t> rows;
+  for(uint32_t row = 0; row < config.numRows; row++)
+  {
+    uint32_t vertex = row;
+    if(config.indices)
+    {
+      uint64_t offset = uint64_t(row) * sizeof(uint32_t);
+      if(offset + sizeof(uint32_t) > config.indices->size())
+      {
+        error = QObject::tr("Index buffer is truncated.");
+        return false;
+      }
+      uint32_t raw = 0;
+      memcpy(&raw, config.indices->data() + offset, sizeof(raw));
+      bool restart = false;
+      if(!FBXExporter::ResolveIndex(raw, config.baseVertex, config.primRestart, vertex, restart,
+                                    error))
+        return false;
+      if(restart)
+      {
+        rows.push_back(UINT32_MAX);
+        continue;
+      }
+    }
+    rows.push_back(uint32_t(mesh.positions.size() / 3));
+    if(!ReadFBXAttribute(config, mapping[0], vertex, 3, mesh.positions, error))
+      return false;
+    for(int a = 0; a < 6; a++)
+      if(mapping[a + 1] >= 0 && !ReadFBXAttribute(config, mapping[a + 1], vertex, components[a],
+                                                  attributes[a]->values, error))
+        return false;
+  }
+  return FBXExporter::Triangulate(config.topology, rows, mesh.triangles, error);
+}
+
+void BufferViewer::exportFBX()
+{
+  if(!m_MeshView || !m_CurView || !m_Ctx.IsCaptureLoaded() || !m_Ctx.CurAction())
+    return;
+
+  // Reference-counted buffers and copied column metadata survive view/event changes.
+  BufferConfiguration snapshot;
+  snapshot = ((BufferItemModel *)m_CurView->model())->getConfig();
+  if(snapshot.topology != Topology::TriangleList && snapshot.topology != Topology::TriangleStrip &&
+     snapshot.topology != Topology::TriangleFan)
+  {
+    RDDialog::critical(this, tr("FBX export"),
+                       tr("Only triangle lists, strips and fans are supported."));
+    return;
+  }
+  const uint32_t eventId = m_Ctx.CurEvent();
+  const QString stage = m_CurView->windowTitle();
+  rdcarray<TextureDescription> textures;
+  const ShaderStage stages[] = {ShaderStage::Vertex,   ShaderStage::Hull,  ShaderStage::Domain,
+                                ShaderStage::Geometry, ShaderStage::Pixel, ShaderStage::Task,
+                                ShaderStage::Mesh};
+  rdcarray<ResourceId> seen;
+  for(ShaderStage shaderStage : stages)
+    for(const UsedDescriptor &used : m_Ctx.CurPipelineState().GetReadOnlyResources(shaderStage))
+    {
+      ResourceId id = used.descriptor.resource;
+      TextureDescription *texture = m_Ctx.GetTexture(id);
+      if(texture && !seen.contains(id))
+      {
+        seen.push_back(id);
+        textures.push_back(*texture);
+      }
+    }
+
+  QDialog dialog(this);
+  dialog.setWindowTitle(tr("FBX attributes"));
+  QFormLayout *layout = new QFormLayout(&dialog);
+  const QString labels[] = {tr("Position"), tr("Normal"), tr("Tangent"), tr("UV 0"),
+                            tr("UV 1"),     tr("UV 2"),   tr("Color")};
+  const QString semantics[] = {lit("POSITION"),  lit("NORMAL"),    lit("TANGENT"), lit("TEXCOORD0"),
+                               lit("TEXCOORD1"), lit("TEXCOORD2"), lit("COLOR")};
+  QVector<QComboBox *> selectors;
+  for(int a = 0; a < 7; a++)
+  {
+    QComboBox *selector = new QComboBox(&dialog);
+    selector->addItem(a == 0 ? tr("Select position...") : tr("None"), -1);
+    for(int col = 0; col < snapshot.columns.count(); col++)
+    {
+      selector->addItem(snapshot.columnName(col), col);
+      QString name = snapshot.columnName(col).toUpper();
+      if(name == semantics[a] || name == semantics[a] + lit("0") ||
+         (a == 3 && name == lit("TEXCOORD")))
+        selector->setCurrentIndex(selector->count() - 1);
+    }
+    if(a == 0)
+      selector->setCurrentIndex(snapshot.guessPositionColumn() + 1);
+    selectors.push_back(selector);
+    layout->addRow(labels[a], selector);
+  }
+  QLabel *note = new QLabel(tr("Exports this stage's coordinates as stored (XYZ). No projection or "
+                               "world-space reconstruction is applied. Textures use mip 0 / slice "
+                               "0, with MSAA resolved."),
+                            &dialog);
+  note->setWordWrap(true);
+  layout->addRow(note);
+  QDialogButtonBox *buttons =
+      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addRow(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  buttons->button(QDialogButtonBox::Ok)->setEnabled(selectors[0]->currentData().toInt() >= 0);
+  QObject::connect(
+      selectors[0], QOverload<int>::of(&QComboBox::currentIndexChanged), [buttons, selectors](int) {
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(selectors[0]->currentData().toInt() >= 0);
+      });
+  if(RDDialog::show(&dialog) != QDialog::Accepted)
+    return;
+  QVector<int> mapping;
+  for(QComboBox *selector : selectors)
+    mapping.push_back(selector->currentData().toInt());
+
+  QString filename = RDDialog::getSaveFileName(this, tr("Export FBX and textures"), QString(),
+                                               tr("FBX files (*.fbx)"));
+  if(filename.isEmpty())
+    return;
+  if(!filename.endsWith(lit(".fbx"), Qt::CaseInsensitive))
+    filename += lit(".fbx");
+  QFileInfo fi(filename);
+  QString directory = fi.absoluteDir().filePath(fi.completeBaseName());
+  // A fresh directory avoids mixing old textures with a new model after a partial export.
+  if(QFileInfo::exists(directory))
+  {
+    RDDialog::critical(
+        this, tr("FBX export"),
+        tr("The export directory already exists. Choose a new name: %1").arg(directory));
+    return;
+  }
+  if(!QDir().mkpath(directory))
+  {
+    RDDialog::critical(this, tr("FBX export"), tr("Couldn't create %1").arg(directory));
+    return;
+  }
+  QString error;
+  QStringList failures;
+  int savedTextures = 0;
+  bool meshSaved = false;
+  LambdaThread *thread =
+      new LambdaThread([this, &snapshot, &mapping, &error, &failures, &savedTextures, &meshSaved,
+                        directory, fi, textures, eventId, stage]() {
+        FBXExporter::Mesh mesh;
+        if(!MakeFBXMesh(snapshot, mapping, mesh, error) ||
+           !FBXExporter::Write(QDir(directory).filePath(fi.fileName()), mesh, error))
+          return;
+        meshSaved = true;
+        // A single replay operation prevents SetFrameEvent from interleaving texture saves.
+        m_Ctx.Replay().BlockInvoke([&](IReplayController *r) {
+          r->SetFrameEvent(eventId, true);
+          for(const TextureDescription &texture : textures)
+          {
+            TextureSave save;
+            save.resourceId = texture.resourceId;
+            save.mip = 0;
+            save.slice.sliceIndex = 0;
+            save.sample.sampleIndex = TextureSampleMapping::ResolveSamples;
+            save.destType = texture.format.compCount == 4 ? FileType::PNG : FileType::JPG;
+            QString name = QString(ToStr(texture.resourceId)).replace(lit("::"), lit("_")) +
+                           (save.destType == FileType::PNG ? lit(".png") : lit(".jpg"));
+            ResultDetails result = r->SaveTexture(save, QDir(directory).filePath(name));
+            if(result.OK())
+              savedTextures++;
+            else
+              failures << tr("%1: %2").arg(name).arg(QString(result.Message()));
+          }
+        });
+        QSaveFile report(QDir(directory).filePath(lit("export.txt")));
+        if(report.open(QIODevice::WriteOnly | QIODevice::Text))
+        {
+          QTextStream text(&report);
+          text << "Event: " << eventId << "\nStage: " << stage
+               << "\nInstance: " << snapshot.curInstance
+               << "\nCoordinates: stored XYZ, no projection reconstruction\n"
+               << "Textures: mip 0, slice 0, MSAA resolve; no material inference\n"
+               << "Saved textures: " << savedTextures << "/" << textures.size() << "\n"
+               << failures.join(lit("\n")) << "\n";
+          text.flush();
+          if(text.status() != QTextStream::Ok || !report.commit())
+            failures << tr("Couldn't write export report.");
+        }
+        else
+          failures << tr("Couldn't create export report.");
+      });
+  thread->start();
+  ShowProgressDialog(this, tr("Exporting FBX and textures"),
+                     [thread]() { return !thread->isRunning(); });
+  thread->deleteLater();
+  // Restore the replay state selected by the UI if the user changed events during export.
+  if(m_Ctx.IsCaptureLoaded())
+  {
+    uint32_t currentEvent = m_Ctx.CurEvent();
+    m_Ctx.Replay().BlockInvoke(
+        [currentEvent](IReplayController *r) { r->SetFrameEvent(currentEvent, true); });
+  }
+  if(!meshSaved)
+    RDDialog::critical(this, tr("FBX export failed"), error);
+  else if(!failures.isEmpty())
+    RDDialog::critical(this, tr("FBX exported with errors"), failures.join(lit("\n")));
+  else
+    RDDialog::information(this, tr("FBX export complete"),
+                          tr("Saved mesh and %1 textures to %2").arg(savedTextures).arg(directory));
 }
 
 void BufferViewer::exportCSV(QTextStream &ts, const QString &prefix, RDTreeWidgetItem *item)

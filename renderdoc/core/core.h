@@ -115,6 +115,8 @@ struct DeviceOwnedWindow
 struct IFrameCapturer
 {
   virtual RDCDriver GetFrameCaptureDriver() = 0;
+  // Internal capability query: only ready, idle Vulkan capturers opt in.
+  virtual bool CanBridgeCapture() { return false; }
   virtual void StartFrameCapture(DeviceOwnedWindow devWnd) = 0;
   virtual bool EndFrameCapture(DeviceOwnedWindow devWnd) = 0;
   virtual bool DiscardFrameCapture(DeviceOwnedWindow devWnd) = 0;
@@ -125,6 +127,24 @@ struct IFrameCapturer
   virtual uint32_t SetCommandAnnotation(void *queueOrCommandBuffer, const char *key,
                                         RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth,
                                         const RENDERDOC_AnnotationValue *value) = 0;
+};
+
+// One fixed capture transaction. Calls are serialised by RenderDoc's capture operation lock.
+// Keep the state here independent of the registry so it can be tested without a graphics device.
+struct FrameCaptureGroup
+{
+  struct Member
+  {
+    IFrameCapturer *capturer;
+    DeviceOwnedWindow window;
+  };
+  IFrameCapturer *owner = NULL;
+  rdcarray<Member> members;
+  bool busy = false;
+
+  bool Contains(IFrameCapturer *cap) const;
+  bool Start(IFrameCapturer *cap, DeviceOwnedWindow window, const rdcarray<Member> &peers);
+  bool Finish(IFrameCapturer *cap, bool discard);
 };
 
 struct IDeviceProtocolHandler;
@@ -596,6 +616,7 @@ public:
   // manually through the renderdoc API with NULL device/window handles
   void AddDeviceFrameCapturer(void *dev, IFrameCapturer *cap);
   void RemoveDeviceFrameCapturer(void *dev);
+  void SetVulkanBridgeReady(IFrameCapturer *cap, bool ready);
 
   IFrameCapturer *MatchFrameCapturer(DeviceOwnedWindow devWnd);
 
@@ -754,6 +775,10 @@ private:
 
   int m_CapturesActive;
 
+  // Lock order: capture operation, then registry. Never call drivers under the registry lock.
+  Threading::CriticalSection m_CaptureOperationLock;
+  FrameCaptureGroup m_BridgeCapture;
+  rdcarray<IFrameCapturer *> m_BridgeReadyCapturers;
   Threading::CriticalSection m_CapturerListLock;
   std::map<DeviceOwnedWindow, FrameCap> m_WindowFrameCapturers;
   DeviceOwnedWindow m_ActiveWindow;

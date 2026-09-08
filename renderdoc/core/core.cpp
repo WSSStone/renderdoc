@@ -52,6 +52,10 @@ extern "C" const rdcstr VulkanLayerJSONBasename = STRINGIZE(RDOC_BASE_NAME);
 RDOC_DEBUG_CONFIG(bool, Capture_Debug_SnapshotDiagnosticLog, false,
                   "Snapshot the diagnostic log at capture time and embed in the capture.");
 
+RDOC_CONFIG(bool, Vulkan_BridgeCapture, false,
+            "Capture ready Vulkan instances in this process alongside the selected capturer. "
+            "Each instance produces a separate RDC file. This can increase capture overhead.");
+
 RDOC_CONFIG(bool, Capture_IncludeExtendedThumbnail, false,
             "Save the thumbnail unresized and losslessly encoded during capture.");
 
@@ -1122,13 +1126,83 @@ IFrameCapturer *RenderDoc::MatchFrameCapturer(DeviceOwnedWindow devWnd)
   return it->second.FrameCapturer;
 }
 
+bool FrameCaptureGroup::Contains(IFrameCapturer *cap) const
+{
+  for(const Member &member : members)
+    if(member.capturer == cap)
+      return true;
+  return false;
+}
+
+bool FrameCaptureGroup::Start(IFrameCapturer *cap, DeviceOwnedWindow window,
+                              const rdcarray<Member> &peers)
+{
+  if(owner || busy || !cap)
+    return false;
+  owner = cap;
+  members.push_back({cap, window});
+  for(const Member &peer : peers)
+    if(peer.capturer && !Contains(peer.capturer))
+      members.push_back(peer);
+  busy = true;
+  for(const Member &member : members)
+  {
+    RDCLOG("Bridge capture starting %s capturer %p",
+           ToStr(member.capturer->GetFrameCaptureDriver()).c_str(), member.capturer);
+    member.capturer->StartFrameCapture(member.window);
+  }
+  busy = false;
+  return true;
+}
+
+bool FrameCaptureGroup::Finish(IFrameCapturer *cap, bool discard)
+{
+  if(!owner || cap != owner || busy)
+    return false;
+  busy = true;
+  bool success = true;
+  // Complete files sequentially: the existing RDC writer owns a process-wide current filename.
+  for(const Member &member : members)
+  {
+    bool result = discard ? member.capturer->DiscardFrameCapture(member.window)
+                          : member.capturer->EndFrameCapture(member.window);
+    if(!result)
+    {
+      RDCERR("Bridge capture failed for capturer %p", member.capturer);
+      member.capturer->DiscardFrameCapture(member.window);
+      success = false;
+    }
+  }
+  members.clear();
+  owner = NULL;
+  busy = false;
+  return success;
+}
+
 void RenderDoc::StartFrameCapture(DeviceOwnedWindow devWnd)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
+  if(m_BridgeCapture.owner)
+    return;
   m_CaptureTitle.clear();
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
-    frameCap->StartFrameCapture(devWnd);
+    if(Vulkan_BridgeCapture())
+    {
+      rdcarray<FrameCaptureGroup::Member> peers;
+      {
+        SCOPED_LOCK(m_CapturerListLock);
+        for(const auto &entry : m_DeviceFrameCapturers)
+          if(m_BridgeReadyCapturers.contains(entry.second) && entry.second->CanBridgeCapture())
+            peers.push_back({entry.second, DeviceOwnedWindow(entry.first, NULL)});
+      }
+      m_BridgeCapture.Start(frameCap, devWnd, peers);
+    }
+    else
+    {
+      frameCap->StartFrameCapture(devWnd);
+    }
     m_CapturesActive++;
   }
 }
@@ -1155,6 +1229,16 @@ void RenderDoc::SetCaptureTitle(const rdcstr &title)
 
 bool RenderDoc::EndFrameCapture(DeviceOwnedWindow devWnd)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
+  if(m_BridgeCapture.owner)
+  {
+    IFrameCapturer *cap = MatchFrameCapturer(devWnd);
+    if(cap != m_BridgeCapture.owner || m_BridgeCapture.busy)
+      return false;
+    bool result = m_BridgeCapture.Finish(cap, false);
+    m_CapturesActive--;
+    return result;
+  }
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
@@ -1167,6 +1251,16 @@ bool RenderDoc::EndFrameCapture(DeviceOwnedWindow devWnd)
 
 bool RenderDoc::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
+  if(m_BridgeCapture.owner)
+  {
+    IFrameCapturer *cap = MatchFrameCapturer(devWnd);
+    if(cap != m_BridgeCapture.owner || m_BridgeCapture.busy)
+      return false;
+    bool result = m_BridgeCapture.Finish(cap, true);
+    m_CapturesActive--;
+    return result;
+  }
   IFrameCapturer *frameCap = MatchFrameCapturer(devWnd);
   if(frameCap)
   {
@@ -2303,8 +2397,29 @@ void RenderDoc::MarkCaptureRetrieved(uint32_t idx)
   }
 }
 
+void RenderDoc::SetVulkanBridgeReady(IFrameCapturer *cap, bool ready)
+{
+  SCOPED_LOCK(m_CaptureOperationLock);
+  if(ready)
+  {
+    if(!m_BridgeReadyCapturers.contains(cap))
+      m_BridgeReadyCapturers.push_back(cap);
+  }
+  else
+  {
+    // Called before Vulkan device teardown, while all capture resources are still valid.
+    if(m_BridgeCapture.Contains(cap))
+    {
+      m_BridgeCapture.Finish(m_BridgeCapture.owner, true);
+      m_CapturesActive--;
+    }
+    m_BridgeReadyCapturers.removeOne(cap);
+  }
+}
+
 void RenderDoc::AddDeviceFrameCapturer(void *dev, IFrameCapturer *cap)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
   if(IsReplayApp())
     return;
 
@@ -2322,6 +2437,7 @@ void RenderDoc::AddDeviceFrameCapturer(void *dev, IFrameCapturer *cap)
 
 void RenderDoc::RemoveDeviceFrameCapturer(void *dev)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
   if(IsReplayApp())
     return;
 
@@ -2333,12 +2449,22 @@ void RenderDoc::RemoveDeviceFrameCapturer(void *dev)
 
   RDCLOG("Removing device frame capturer for %#p", dev);
 
+  IFrameCapturer *cap = NULL;
+  {
+    SCOPED_LOCK(m_CapturerListLock);
+    auto removed = m_DeviceFrameCapturers.find(dev);
+    if(removed != m_DeviceFrameCapturers.end())
+      cap = removed->second;
+  }
+  if(cap)
+    SetVulkanBridgeReady(cap, false);
   SCOPED_LOCK(m_CapturerListLock);
   m_DeviceFrameCapturers.erase(dev);
 }
 
 void RenderDoc::AddFrameCapturer(DeviceOwnedWindow devWnd, IFrameCapturer *cap)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
   if(IsReplayApp())
     return;
 
@@ -2374,6 +2500,13 @@ void RenderDoc::AddFrameCapturer(DeviceOwnedWindow devWnd, IFrameCapturer *cap)
 
 void RenderDoc::RemoveFrameCapturer(DeviceOwnedWindow devWnd)
 {
+  SCOPED_LOCK(m_CaptureOperationLock);
+  IFrameCapturer *removed = MatchFrameCapturer(devWnd);
+  if(removed && m_BridgeCapture.Contains(removed))
+  {
+    m_BridgeCapture.Finish(m_BridgeCapture.owner, true);
+    m_CapturesActive--;
+  }
   if(IsReplayApp())
     return;
 
@@ -2740,6 +2873,90 @@ bool RenderDoc::HasEmbeddedFiles(RDCFile *rdc) const
 #undef Always
 
 #include "catch/catch.hpp"
+
+namespace
+{
+struct MockBridgeCapturer : IFrameCapturer
+{
+  int starts = 0, ends = 0, discards = 0;
+  bool failEnd = false;
+  FrameCaptureGroup *reenter = NULL;
+  RDCDriver GetFrameCaptureDriver() override { return RDCDriver::Vulkan; }
+  void StartFrameCapture(DeviceOwnedWindow window) override
+  {
+    starts++;
+    if(reenter)
+    {
+      CHECK_FALSE(reenter->Start(this, window, {}));
+      CHECK_FALSE(reenter->Finish(this, false));
+    }
+  }
+  bool EndFrameCapture(DeviceOwnedWindow) override
+  {
+    ends++;
+    return !failEnd;
+  }
+  bool DiscardFrameCapture(DeviceOwnedWindow) override
+  {
+    discards++;
+    return true;
+  }
+  uint32_t SetObjectAnnotation(void *, const char *, RENDERDOC_AnnotationType, uint32_t,
+                               const RENDERDOC_AnnotationValue *) override
+  {
+    return 0;
+  }
+  uint32_t SetCommandAnnotation(void *, const char *, RENDERDOC_AnnotationType, uint32_t,
+                                const RENDERDOC_AnnotationValue *) override
+  {
+    return 0;
+  }
+};
+}
+
+TEST_CASE("Bridge capture transactions pair participants and reject reentry", "[core][bridge]")
+{
+  FrameCaptureGroup group;
+  MockBridgeCapturer owner, peer, late;
+  owner.reenter = &group;
+  DeviceOwnedWindow window(NULL, NULL);
+  REQUIRE(group.Start(&owner, window, {{&peer, window}, {&owner, window}, {&peer, window}}));
+  CHECK(owner.starts == 1);
+  CHECK(peer.starts == 1);
+  CHECK_FALSE(group.Start(&late, window, {}));
+  CHECK_FALSE(group.Finish(&peer, false));
+  CHECK(peer.ends == 0);
+  REQUIRE(group.Finish(&owner, false));
+  CHECK(owner.ends == 1);
+  CHECK(peer.ends == 1);
+  CHECK(group.owner == NULL);
+  CHECK_FALSE(group.Finish(&owner, false));
+  REQUIRE(group.Start(&owner, window, {}));
+  REQUIRE(group.Finish(&owner, true));
+  CHECK(owner.discards == 1);
+  CHECK(peer.discards == 0);
+}
+
+TEST_CASE("Bridge failures and participant teardown clear the whole transaction", "[core][bridge]")
+{
+  FrameCaptureGroup group;
+  MockBridgeCapturer owner, peer;
+  DeviceOwnedWindow window(NULL, NULL);
+  peer.failEnd = true;
+  REQUIRE(group.Start(&owner, window, {{&peer, window}}));
+  CHECK_FALSE(group.Finish(&owner, false));
+  CHECK(peer.discards == 1);
+  CHECK(group.members.empty());
+  REQUIRE(group.Start(&owner, window, {{&peer, window}}));
+  // Device teardown discards the transaction before deleting any member's resources.
+  REQUIRE(group.Contains(&peer));
+  REQUIRE(group.Finish(group.owner, true));
+  CHECK(owner.discards == 1);
+  CHECK(peer.discards == 2);
+  CHECK_FALSE(group.Contains(&peer));
+  REQUIRE(group.Start(&owner, window, {}));
+  REQUIRE(group.Finish(&owner, false));
+}
 
 TEST_CASE("Check ResourceId tostr", "[tostr]")
 {
