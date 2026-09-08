@@ -66,6 +66,6 @@ tests write a fixture that a separate Linux job loads using a pinned version of
 [ufbx](https://github.com/ufbx/ufbx). That job checks positions, triangle topology, normals,
 tangents, vertex colors and all three UV sets. ufbx is a CI dependency only.
 
-Artifacts include build/test logs and the complete `x64/Release` output. Extract the Release
+Artifacts include build/test logs and the `x64/Release` runtime output (excluding intermediate object files). Extract the Release
 artifact and launch `qrenderdoc.exe`; keep its DLLs and runtime subdirectories together.
 Real application capture and DCC import workflows remain manual validation.
