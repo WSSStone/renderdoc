@@ -240,6 +240,12 @@ WrappedVulkan::WrappedVulkan()
 
 WrappedVulkan::~WrappedVulkan()
 {
+  // Also cover abnormal shutdown paths that did not call vkDestroyDevice/Instance.
+  if(!IsReplayMode(m_State) && m_Instance != VK_NULL_HANDLE)
+    RenderDoc::Inst().RemoveDeviceFrameCapturer(LayerDisp(m_Instance));
+  else
+    RenderDoc::Inst().SetVulkanBridgeReady(this, false);
+
   // records must be deleted before resource manager shutdown
   if(m_FrameCaptureRecord)
   {

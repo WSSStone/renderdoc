@@ -6439,7 +6439,10 @@ static bool ReadFBXAttribute(const BufferConfiguration &config, int column, uint
   if(column < config.genericsEnabled.size() && config.genericsEnabled[column])
   {
     if(column >= config.generics.size())
+    {
+      error = QObject::tr("Missing constant vertex attribute.");
       return false;
+    }
     for(int c = 0; c < qMin(4, int(el.type.columns)); c++)
     {
       if(prop.format.compType == CompType::UInt)
@@ -6462,11 +6465,17 @@ static bool ReadFBXAttribute(const BufferConfiguration &config, int column, uint
     uint64_t element = vertex;
     if(prop.perinstance)
       element = prop.instancerate > 0 ? config.curInstance / prop.instancerate : 0;
+    if(element && uint64_t(buffer->stride) > (UINT64_MAX - el.byteOffset) / element)
+    {
+      error = QObject::tr("Vertex attribute offset overflows.");
+      return false;
+    }
     uint64_t offset = uint64_t(el.byteOffset) + uint64_t(buffer->stride) * element;
     uint64_t byteSize = el.type.arrayByteStride;
     if(!byteSize)
       byteSize = prop.format.ElementSize();
-    if(offset > buffer->size() || byteSize > buffer->size() - offset)
+    if(!byteSize || !buffer->hasData() || offset > buffer->size() ||
+       byteSize > buffer->size() - offset)
     {
       error = QObject::tr("Attribute '%1' reads past the vertex buffer.").arg(QString(el.name));
       return false;
@@ -6500,6 +6509,7 @@ static bool MakeFBXMesh(const BufferConfiguration &config, const QVector<int> &m
                         FBXExporter::Mesh &mesh, QString &error)
 {
   if(config.noVertices || config.noInstances || config.numRows == 0 ||
+     config.unclampedNumRows > config.numRows || config.pagingOffset != 0 ||
      config.numRows > uint32_t(INT_MAX / 4))
   {
     error = QObject::tr("No exportable mesh, or mesh exceeds the exporter size limit.");
@@ -6703,6 +6713,7 @@ void BufferViewer::exportFBX()
   thread->start();
   ShowProgressDialog(this, tr("Exporting FBX and textures"),
                      [thread]() { return !thread->isRunning(); });
+  thread->wait();
   thread->deleteLater();
   // Restore the replay state selected by the UI if the user changed events during export.
   if(m_Ctx.IsCaptureLoaded())
@@ -7819,3 +7830,93 @@ void BufferViewer::on_autofitCamera_clicked()
 
   INVOKE_MEMFN(RT_UpdateAndDisplay);
 }
+
+#if ENABLE_UNIT_TESTS
+#include "3rdparty/catch/catch.hpp"
+
+TEST_CASE("FBX decodes mesh buffers with offsets and per-instance attributes", "[fbx]")
+{
+  BufferConfiguration config;
+  config.numRows = 3;
+  config.baseVertex = -3;
+  config.curInstance = 3;
+  ShaderConstant position;
+  position.name = "POSITION";
+  position.byteOffset = 4;
+  position.type.baseType = VarType::Float;
+  position.type.rows = 1;
+  position.type.columns = 3;
+  position.type.arrayByteStride = 12;
+  BufferElementProperties prop;
+  prop.format.type = ResourceFormatType::Regular;
+  prop.format.compType = CompType::Float;
+  prop.format.compCount = 3;
+  prop.format.compByteWidth = 4;
+  config.columns.push_back(position);
+  config.props.push_back(prop);
+  BufferData *vertices = new BufferData;
+  vertices->stride = 12;
+  const float data[] = {99, 0, 0, 0, 1, 0, 0, 0, 1, 0};
+  vertices->storage.resize(sizeof(data));
+  memcpy(vertices->storage.data(), data, sizeof(data));
+  config.buffers.push_back(vertices);
+  config.indices = new BufferData;
+  const uint32_t indices[] = {3, 4, 5};
+  config.indices->storage.resize(sizeof(indices));
+  memcpy(config.indices->storage.data(), indices, sizeof(indices));
+
+  ShaderConstant normal = position;
+  normal.name = "NORMAL";
+  normal.byteOffset = 0;
+  prop.buffer = 1;
+  prop.perinstance = true;
+  prop.instancerate = 2;
+  config.columns.push_back(normal);
+  config.props.push_back(prop);
+  BufferData *normals = new BufferData;
+  normals->stride = 12;
+  const float normalData[] = {0, 1, 0, 0, 0, 1};
+  normals->storage.resize(sizeof(normalData));
+  memcpy(normals->storage.data(), normalData, sizeof(normalData));
+  config.buffers.push_back(normals);
+
+  QVector<int> mapping = {0, 1, -1, -1, -1, -1, -1};
+  QString error;
+  FBXExporter::Mesh mesh;
+  REQUIRE(MakeFBXMesh(config, mapping, mesh, error));
+  CHECK(mesh.positions == QVector<double>({0, 0, 0, 1, 0, 0, 0, 1, 0}));
+  CHECK(mesh.normal.values == QVector<double>({0, 0, 1, 0, 0, 1, 0, 0, 1}));
+  CHECK(mesh.triangles == QVector<uint32_t>({0, 1, 2}));
+
+  SECTION("Missing position is rejected")
+  {
+    mapping[0] = -1;
+    mesh = FBXExporter::Mesh();
+    CHECK_FALSE(MakeFBXMesh(config, mapping, mesh, error));
+  }
+  SECTION("Truncated vertex data is rejected")
+  {
+    vertices->storage.resize(sizeof(data) - 1);
+    mesh = FBXExporter::Mesh();
+    CHECK_FALSE(MakeFBXMesh(config, mapping, mesh, error));
+  }
+  SECTION("Truncated index data is rejected")
+  {
+    config.indices->storage.resize(sizeof(indices) - 1);
+    mesh = FBXExporter::Mesh();
+    CHECK_FALSE(MakeFBXMesh(config, mapping, mesh, error));
+  }
+  SECTION("Invalid buffer binding is rejected")
+  {
+    config.props[0].buffer = -1;
+    mesh = FBXExporter::Mesh();
+    CHECK_FALSE(MakeFBXMesh(config, mapping, mesh, error));
+  }
+  SECTION("Integer offset overflow is rejected")
+  {
+    vertices->stride = SIZE_MAX;
+    mesh = FBXExporter::Mesh();
+    CHECK_FALSE(MakeFBXMesh(config, mapping, mesh, error));
+  }
+}
+#endif

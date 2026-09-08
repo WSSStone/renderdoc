@@ -1230,6 +1230,8 @@ void RenderDoc::SetCaptureTitle(const rdcstr &title)
 bool RenderDoc::EndFrameCapture(DeviceOwnedWindow devWnd)
 {
   SCOPED_LOCK(m_CaptureOperationLock);
+  if(m_CapturesActive <= 0)
+    return false;
   if(m_BridgeCapture.owner)
   {
     IFrameCapturer *cap = MatchFrameCapturer(devWnd);
@@ -1252,6 +1254,8 @@ bool RenderDoc::EndFrameCapture(DeviceOwnedWindow devWnd)
 bool RenderDoc::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 {
   SCOPED_LOCK(m_CaptureOperationLock);
+  if(m_CapturesActive <= 0)
+    return false;
   if(m_BridgeCapture.owner)
   {
     IFrameCapturer *cap = MatchFrameCapturer(devWnd);
@@ -2880,8 +2884,11 @@ struct MockBridgeCapturer : IFrameCapturer
 {
   int starts = 0, ends = 0, discards = 0;
   bool failEnd = false;
+  bool ready = true;
+  RDCDriver driver = RDCDriver::Vulkan;
   FrameCaptureGroup *reenter = NULL;
-  RDCDriver GetFrameCaptureDriver() override { return RDCDriver::Vulkan; }
+  RDCDriver GetFrameCaptureDriver() override { return driver; }
+  bool CanBridgeCapture() override { return ready; }
   void StartFrameCapture(DeviceOwnedWindow window) override
   {
     starts++;
@@ -2956,6 +2963,75 @@ TEST_CASE("Bridge failures and participant teardown clear the whole transaction"
   CHECK_FALSE(group.Contains(&peer));
   REQUIRE(group.Start(&owner, window, {}));
   REQUIRE(group.Finish(&owner, false));
+}
+
+TEST_CASE("Core bridge switch, readiness and teardown integration", "[core][bridge]")
+{
+  RenderDoc &core = RenderDoc::Inst();
+  SDObject *setting = core.SetConfigSetting("Vulkan.BridgeCapture");
+  REQUIRE(setting != NULL);
+  MockBridgeCapturer owner, peer, unready;
+  owner.driver = RDCDriver::D3D11;
+  unready.ready = false;
+  struct Restore
+  {
+    RenderDoc &core;
+    SDObject *setting;
+    bool enabled, replay;
+    MockBridgeCapturer &owner, &peer, &unready;
+    ~Restore()
+    {
+      if(core.IsFrameCapturing())
+        core.DiscardFrameCapture(DeviceOwnedWindow(&owner, NULL));
+      core.RemoveDeviceFrameCapturer(&owner);
+      core.RemoveDeviceFrameCapturer(&peer);
+      core.RemoveDeviceFrameCapturer(&unready);
+      setting->data.basic.b = enabled;
+      core.SetReplayApp(replay);
+    }
+  } restore = {core, setting, setting->data.basic.b, core.IsReplayApp(), owner, peer, unready};
+  core.SetReplayApp(false);
+  core.AddDeviceFrameCapturer(&owner, &owner);
+  core.AddDeviceFrameCapturer(&peer, &peer);
+  core.AddDeviceFrameCapturer(&unready, &unready);
+  core.SetVulkanBridgeReady(&peer, true);
+  core.SetVulkanBridgeReady(&unready, true);
+  DeviceOwnedWindow window(&owner, NULL);
+
+  setting->data.basic.b = false;
+  core.StartFrameCapture(window);
+  CHECK(owner.starts == 1);
+  CHECK(peer.starts == 0);
+  REQUIRE(core.EndFrameCapture(window));
+  CHECK_FALSE(core.IsFrameCapturing());
+
+  setting->data.basic.b = true;
+  core.StartFrameCapture(window);
+  CHECK(owner.starts == 2);
+  CHECK(peer.starts == 1);
+  CHECK(unready.starts == 0);
+  core.StartFrameCapture(window);
+  CHECK(owner.starts == 2);
+  CHECK_FALSE(core.EndFrameCapture(DeviceOwnedWindow(&peer, NULL)));
+  CHECK(core.IsFrameCapturing());
+  // Turning the setting off during a capture must not abandon its participants.
+  setting->data.basic.b = false;
+  REQUIRE(core.EndFrameCapture(window));
+  CHECK(peer.ends == 1);
+  CHECK_FALSE(core.IsFrameCapturing());
+  CHECK_FALSE(core.EndFrameCapture(window));
+  CHECK_FALSE(core.DiscardFrameCapture(window));
+
+  setting->data.basic.b = true;
+  core.StartFrameCapture(window);
+  core.SetVulkanBridgeReady(&peer, false);
+  CHECK(owner.discards == 1);
+  CHECK(peer.discards == 1);
+  CHECK_FALSE(core.IsFrameCapturing());
+  core.StartFrameCapture(window);
+  CHECK(peer.starts == 2);
+  REQUIRE(core.DiscardFrameCapture(window));
+  CHECK_FALSE(core.IsFrameCapturing());
 }
 
 TEST_CASE("Check ResourceId tostr", "[tostr]")

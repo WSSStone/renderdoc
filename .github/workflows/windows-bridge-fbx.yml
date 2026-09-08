@@ -33,25 +33,30 @@ jobs:
         if: matrix.configuration == 'Development'
         shell: bash
         run: |
-          util/clangformat/clang-format-15.0.exe --dry-run --Werror renderdoc/core/core.{h,cpp} renderdoc/driver/vulkan/vk_core.h renderdoc/driver/vulkan/wrappers/vk_device_funcs.cpp qrenderdoc/Code/FBXExporter.{h,cpp} qrenderdoc/Windows/BufferViewer.{h,cpp}
+          util/clangformat/clang-format-15.0.exe --dry-run --Werror renderdoc/core/core.{h,cpp} renderdoc/driver/vulkan/vk_core.{h,cpp} renderdoc/driver/vulkan/wrappers/vk_device_funcs.cpp qrenderdoc/Code/FBXExporter.{h,cpp} qrenderdoc/Windows/BufferViewer.{h,cpp}
       - name: Build complete solution
+        id: build
         shell: pwsh
         run: |
           msbuild.exe renderdoc.sln /m /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /p:PlatformToolset=v143 /bl:build.binlog /fl '/flp:logfile=build.log;verbosity=normal'
           exit $LASTEXITCODE
       - name: Core unit tests
         if: matrix.configuration == 'Development'
-        shell: pwsh
+        shell: bash
         run: |
-          & ./x64/Development/renderdoccmd.exe test unit -o core-tests.log
-          exit $LASTEXITCODE
+          ./x64/Development/renderdoccmd.exe test unit -o core-tests.log || {
+            cat core-tests.log
+            exit 1
+          }
+          cat core-tests.log
       - name: UI unit tests and FBX fixture
-        if: matrix.configuration == 'Development'
+        if: ${{ !cancelled() && matrix.configuration == 'Development' && steps.build.outcome == 'success' }}
         shell: pwsh
         env:
           RENDERDOC_FBX_TEST_OUTPUT: ${{ github.workspace }}/fbx-fixture.fbx
         run: |
           $process = Start-Process -FilePath ./x64/Development/qrenderdoc.exe -ArgumentList '--unittest', 'log=ui-tests.log' -Wait -PassThru
+          if (Test-Path ui-tests.log) { Get-Content ui-tests.log }
           if ($process.ExitCode) { exit $process.ExitCode }
           if (!(Test-Path fbx-fixture.fbx)) { throw 'FBX fixture test did not run' }
       - name: Upload logs

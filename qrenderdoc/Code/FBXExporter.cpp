@@ -97,7 +97,7 @@ static bool CheckAttribute(const Attribute &attr, int vertices, int components)
 {
   if(attr.values.isEmpty())
     return true;
-  if(attr.components != components || attr.values.size() != vertices * components)
+  if(attr.components != components || int64_t(attr.values.size()) != int64_t(vertices) * components)
     return false;
   for(double value : attr.values)
     if(!std::isfinite(value))
